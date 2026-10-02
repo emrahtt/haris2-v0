@@ -8,7 +8,6 @@ import { CITATIONS, RISKS } from "@/lib/data/legal";
 import {
   Brain,
   Sparkles,
-  Scale,
   Shield,
   Search,
   Check,

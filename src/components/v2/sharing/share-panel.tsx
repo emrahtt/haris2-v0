@@ -45,7 +45,8 @@ export function SharePanel({ workspaceId, onClose }: Props) {
 
   useEffect(() => {
     void load();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- load is re-created each render; reload only when the workspace changes
+  }, [workspaceId]);
 
   async function load() {
     try {

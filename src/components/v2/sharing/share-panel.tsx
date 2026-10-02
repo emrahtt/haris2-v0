@@ -9,7 +9,7 @@
  *  - Davet iptal
  */
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 interface Share {
   id: string;
@@ -43,12 +43,7 @@ export function SharePanel({ workspaceId, onClose }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load is re-created each render; reload only when the workspace changes
-  }, [workspaceId]);
-
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const res = await fetch(`/api/v2/workspaces/${workspaceId}/shares`);
       if (res.ok) {
@@ -58,7 +53,11 @@ export function SharePanel({ workspaceId, onClose }: Props) {
     } catch {
       // ignore
     }
-  }
+  }, [workspaceId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   async function invite() {
     if (!email.trim()) return;

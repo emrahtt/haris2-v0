@@ -59,7 +59,7 @@ interface AgentResult {
 export function AIAnalysisRunner({ caseItem }: Props) {
   const [results, setResults] = useState<AgentResult[]>([]);
   const [activeAgent, setActiveAgent] = useState<AgentId | null>(null);
-  const [currentText, setCurrentText] = useState("");
+  const [, setCurrentText] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [selectedView, setSelectedView] = useState<AgentId | null>(null);
 

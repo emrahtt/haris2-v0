@@ -49,6 +49,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const userId = await getCurrentUserId();
+    const limitCheck = await checkScrapingLimit(userId);
+    if (!limitCheck.allowed) {
+      return new Response(
+        JSON.stringify({ error: limitCheck.reason, limit: limitCheck }),
+        { status: 429, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    await incrementUsage("scraping_jobs", 1, userId);
+
     const input: ScrapingJobInput = {
       ...parsed.data,
       triggerType: "manual",

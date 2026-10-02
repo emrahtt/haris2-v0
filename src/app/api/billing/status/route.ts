@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { getCurrentSubscription, getCurrentUsage } from "@/lib/billing/subscriptions-db";
 import { getPlan } from "@/lib/billing/plans";
 import { activeProvider } from "@/lib/billing/config";
-import { getBonusCalls, isBillingOwner } from "@/lib/billing/credits";
 import { createClient } from "@/lib/supabase/server";
 import { isDemoMode, DEMO_USER } from "@/lib/supabase/config";
 

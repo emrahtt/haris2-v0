@@ -59,7 +59,6 @@ interface AgentResult {
 export function AIAnalysisRunner({ caseItem }: Props) {
   const [results, setResults] = useState<AgentResult[]>([]);
   const [activeAgent, setActiveAgent] = useState<AgentId | null>(null);
-  const [, setCurrentText] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [selectedView, setSelectedView] = useState<AgentId | null>(null);
 
@@ -75,7 +74,6 @@ export function AIAnalysisRunner({ caseItem }: Props) {
 
     for (const agentId of PIPELINE) {
       setActiveAgent(agentId);
-      setCurrentText("");
 
       const previousOutputs: Record<string, string> = {};
       for (const prev of accumulated) {

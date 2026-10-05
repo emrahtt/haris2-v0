@@ -278,7 +278,13 @@ export function OrchestratorChat({
               value={input}
               onChange={handleInputChange}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && !showMentionMenu) {
+                if (
+                  e.key === "Enter" &&
+                  !e.shiftKey &&
+                  !showMentionMenu &&
+                  !e.nativeEvent.isComposing &&
+                  e.keyCode !== 229
+                ) {
                   e.preventDefault();
                   handleSubmit();
                 }

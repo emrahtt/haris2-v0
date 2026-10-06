@@ -1,22 +1,27 @@
 /**
- * HARIS v2 — Belge metin çıkarma (PRODUCTION-GRADE v3)
+ * HARIS v2 — Belge metin çıkarma (v4)
  *
- * KULLANICI METİN ÇIKARMA YÖNTEMİ SEÇEBİLİR (Faz 13.2):
- *   - "auto"             → Akıllı default (genel kullanım)
- *   - "fast"             → pdf-parse / mammoth (AI yok, hızlı, ucuz)
- *   - "claude_vision"    → Anthropic Sonnet 4.6 + native PDF beta
- *   - "openai_vision"    → PDF → PNG → GPT-4o Vision (kanıtlanmış)
- *   - "gemini_vision"    → PDF → PNG → Gemini Pro Vision (Türkçe + tablo en iyi)
- *   - "best_of_3"        → 3 modeli paralel çalıştır, en uzun çıktıyı seç
+ * OCR modelleri görsel analiz modelinden AYRIDIR → bkz. ./ocr-config.ts
  *
- * Hata yönetimi: 3x retry, exponential backoff, Türkçe humanized hata mesajları
- * Büyük PDF: otomatik 3 sayfalık parçalara böl
+ * KULLANICI YÖNTEMİ (Faz 13.2):
+ *   - "auto"           → pdf-parse (+onarım) kaliteliyse onu kullan, değilse AI zinciri
+ *   - "fast"           → pdf-parse / mammoth (AI yok)
+ *   - "gemini_vision"  → Gemini, PDF'in KENDİSİNİ okur (PNG'ye çevirmeden)
+ *   - "claude_vision"  → Claude native PDF
+ *   - "openai_vision"  → PDF → PNG → GPT Vision (sayfa sayfa)
+ *   - "best_of_3"      → 3 motor paralel, en iyi çıktı
+ *
+ * Seçilen motor başarısız olursa diğer motorlara sırayla düşülür; belge ancak
+ * hepsi başarısız olursa hata verir.
  */
 
-import pdfParse from "pdf-parse";
 import mammoth from "mammoth";
 import { pdfToPng } from "pdf-to-png-converter";
 import { readUdf, isUdfFile } from "../udf/reader";
+import { getOcrModels, OCR_SYSTEM_PROMPT } from "./ocr-config";
+import { geminiOcr, hasGeminiKey } from "./gemini-ocr";
+import { readPdfText, assessTextQuality, splitPdf, type PdfChunk } from "./pdf-utils";
+import { prepareImage } from "./image-prep";
 
 export type ExtractionMethod =
   | "auto"
@@ -40,9 +45,35 @@ export interface ExtractResult {
   comparison?: Array<{ model: string; chars: number; cost: number }>;
 }
 
+type Engine = "gemini" | "claude" | "openai";
+
+interface EngineOutcome {
+  ok: boolean;
+  text: string;
+  modelUsed: string;
+  cost: number;
+  pageCount?: number;
+  warning?: string;
+  error?: string;
+}
+
 const MAX_PDF_SIZE = 30 * 1024 * 1024;
-const _CHUNK_THRESHOLD_BYTES = 3 * 1024 * 1024;
-const _PAGES_PER_CHUNK = 3;
+const GEMINI_PAGES_PER_CHUNK = 20;
+
+const ENGINE_LABEL: Record<Engine, string> = {
+  gemini: "Gemini",
+  claude: "Claude",
+  openai: "GPT Vision",
+};
+
+const ENGINE_ORDER: Record<ExtractionMethod, Engine[]> = {
+  auto: ["gemini", "claude", "openai"],
+  fast: ["gemini", "claude", "openai"],
+  best_of_3: ["gemini", "claude", "openai"],
+  gemini_vision: ["gemini", "claude", "openai"],
+  claude_vision: ["claude", "gemini", "openai"],
+  openai_vision: ["openai", "gemini", "claude"],
+};
 
 // ─────────────────────────────────────────────────────────
 // ANA FONKSİYON
@@ -57,12 +88,10 @@ export async function extractFromFile(
   const startTime = Date.now();
   const lower = filename.toLowerCase();
 
-  // UDF
   if (isUdfFile(filename, mimeType)) {
     return extractUdf(buffer, startTime);
   }
 
-  // DOCX
   if (
     mimeType.includes("officedocument.wordprocessingml") ||
     lower.endsWith(".docx")
@@ -70,7 +99,6 @@ export async function extractFromFile(
     return extractDocx(buffer, startTime);
   }
 
-  // TXT/MD
   if (
     mimeType.startsWith("text/") ||
     lower.endsWith(".txt") ||
@@ -85,14 +113,13 @@ export async function extractFromFile(
     };
   }
 
-  // Görsel (JPG/PNG)
-  if (mimeType.startsWith("image/")) {
-    return extractImageWithMethod(buffer, mimeType, method, startTime);
+  if (mimeType.startsWith("image/") || /\.(jpe?g|png|webp|heic|heif|tiff?|bmp|gif)$/.test(lower)) {
+    const imageMime = mimeType.startsWith("image/") ? mimeType : guessImageMime(lower);
+    return extractImage(buffer, imageMime, method, startTime);
   }
 
-  // PDF
   if (mimeType === "application/pdf" || lower.endsWith(".pdf")) {
-    return extractPdfWithMethod(buffer, method, startTime);
+    return extractPdf(buffer, method, startTime);
   }
 
   return {
@@ -106,125 +133,399 @@ export async function extractFromFile(
 }
 
 // ─────────────────────────────────────────────────────────
-// PDF EXTRACTION — Method seçimine göre
+// PDF
 // ─────────────────────────────────────────────────────────
 
-async function extractPdfWithMethod(
+async function extractPdf(
   buffer: Buffer,
   method: ExtractionMethod,
   startTime: number
 ): Promise<ExtractResult> {
   if (buffer.length > MAX_PDF_SIZE) {
     const sizeMB = (buffer.length / 1024 / 1024).toFixed(1);
-    return {
-      text: "",
-      method: "fallback",
-      usedAI: false,
-      durationMs: Date.now() - startTime,
-      error: `PDF ${sizeMB}MB > 30MB`,
-      userMessage: `📄 PDF çok büyük (${sizeMB} MB). Maksimum 30 MB. Dosyayı bölüp tekrar yükleyin.`,
-    };
+    return errorResult(
+      startTime,
+      `PDF ${sizeMB}MB > 30MB`,
+      `📄 PDF çok büyük (${sizeMB} MB). Maksimum 30 MB. Dosyayı bölüp tekrar yükleyin.`
+    );
   }
 
-  // pdf-parse ile sayfa sayısı + ham metin (her durumda)
-  let pageCount = 0;
-  let pdfParseText = "";
-  try {
-    const parsed = await pdfParse(buffer);
-    pageCount = parsed.numpages || 0;
-    pdfParseText = parsed.text?.trim() ?? "";
-  } catch {
-    pageCount = 0;
-  }
+  const parsed = await readPdfText(buffer);
+  const pageCount = parsed.pageCount;
+  const quality = assessTextQuality(parsed.text, pageCount);
+  const parserLabel = parsed.repairedBuffer ? "pdf-parse (onarılmış PDF)" : "pdf-parse";
 
-  // FAST mode → sadece pdf-parse
   if (method === "fast") {
-    if (pdfParseText.length > 50) {
+    if (parsed.text.length > 50) {
       return {
-        text: pdfParseText,
+        text: parsed.text,
         pageCount,
         method: "pdf_parse_fast",
-        modelUsed: "pdf-parse (AI yok)",
+        modelUsed: `${parserLabel} — AI yok`,
         usedAI: false,
         durationMs: Date.now() - startTime,
+        userMessage: quality.usable
+          ? undefined
+          : `⚠️ Metin kalitesi düşük olabilir (${quality.reason}). Daha iyi sonuç için 'Gemini' yöntemini deneyin.`,
       };
     }
     return {
-      text: "",
+      ...errorResult(
+        startTime,
+        "Hızlı modda metin boş",
+        "📄 Hızlı modda metin çıkarılamadı (PDF taranmış veya bozuk olabilir). 'Akıllı' veya 'Gemini' yöntemini deneyin."
+      ),
       pageCount,
-      method: "fallback",
-      usedAI: false,
-      durationMs: Date.now() - startTime,
-      error: "Hızlı modda metin boş",
-      userMessage:
-        "📄 Hızlı modda metin çıkarılamadı (PDF taranmış görsel olabilir). 'Claude Vision', 'OpenAI Vision' veya 'Gemini Vision' deneyin.",
     };
   }
 
-  // AUTO mode → pdf-parse zayıfsa OpenAI Vision'a düş (kanıtlanmış)
-  if (method === "auto") {
-    if (pdfParseText.length > 200) {
-      return {
-        text: pdfParseText,
-        pageCount,
-        method: "auto_pdf_parse",
-        modelUsed: "Otomatik (pdf-parse yeterliydi)",
-        usedAI: false,
-        durationMs: Date.now() - startTime,
-      };
-    }
-    method = "openai_vision"; // fallback
+  if (method === "auto" && quality.usable) {
+    return {
+      text: parsed.text,
+      pageCount,
+      method: "auto_pdf_parse",
+      modelUsed: `Otomatik (${parserLabel} yeterliydi)`,
+      usedAI: false,
+      durationMs: Date.now() - startTime,
+    };
   }
 
-  // CLAUDE VISION — direct PDF
-  if (method === "claude_vision") {
-    return extractWithClaudeVision(buffer, pageCount, startTime);
-  }
+  const rasterSource = parsed.repairedBuffer ?? buffer;
+  const runEngine = (engine: Engine) => runPdfEngine(engine, buffer, rasterSource, pageCount);
 
-  // OPENAI VISION — PDF → PNG → GPT-4o
-  if (method === "openai_vision") {
-    return extractWithOpenAIVision(buffer, pageCount, startTime);
-  }
-
-  // GEMINI VISION — PDF → PNG → Gemini Pro
-  if (method === "gemini_vision") {
-    return extractWithGeminiVision(buffer, pageCount, startTime);
-  }
-
-  // BEST OF 3 — Paralel 3 model, en iyi çıktı seç
   if (method === "best_of_3") {
-    return extractBestOf3(buffer, pageCount, startTime);
+    return pickBestOf3(await runAllEngines(runEngine), pageCount, startTime);
   }
 
-  // Fallback
-  return extractWithOpenAIVision(buffer, pageCount, startTime);
+  const result = await runEngineChain(ENGINE_ORDER[method], runEngine, pageCount, startTime);
+  if (result.text) return result;
+
+  if (parsed.text.length > 50) {
+    return {
+      text: parsed.text,
+      pageCount,
+      method: "pdf_parse_fallback",
+      modelUsed: `${parserLabel} (AI okuyamadı)`,
+      usedAI: false,
+      durationMs: Date.now() - startTime,
+      error: result.error,
+      userMessage:
+        "⚠️ AI modelleri belgeyi okuyamadı; ham PDF metni kullanıldı, hatalı karakterler içerebilir.",
+    };
+  }
+  return { ...result, pageCount };
+}
+
+function runPdfEngine(
+  engine: Engine,
+  original: Buffer,
+  rasterSource: Buffer,
+  pageCount: number
+): Promise<EngineOutcome> {
+  if (engine === "gemini") return pdfWithGemini(original, pageCount);
+  if (engine === "claude") return pdfWithClaude(original, pageCount);
+  return pdfWithOpenAI(rasterSource);
+}
+
+async function pdfWithGemini(buffer: Buffer, pageCount: number): Promise<EngineOutcome> {
+  if (!hasGeminiKey()) return engineFail("GEMINI_API_KEY eksik");
+
+  const chunks: PdfChunk[] = (await splitPdf(buffer, GEMINI_PAGES_PER_CHUNK)) ?? [
+    { data: buffer, startPage: 1, endPage: pageCount },
+  ];
+  const totalPages = chunks[chunks.length - 1].endPage || pageCount;
+
+  const results = await runWithLimit(
+    chunks.map((chunk) => () =>
+      geminiOcr({
+        data: chunk.data,
+        mimeType: "application/pdf",
+        systemPrompt: OCR_SYSTEM_PROMPT,
+        prompt: pdfChunkPrompt(chunk, chunks.length, totalPages),
+      })
+    ),
+    3
+  );
+
+  const succeeded = results.filter((r) => r.ok);
+  if (succeeded.length === 0) {
+    return engineFail(results.map((r) => r.error).filter(Boolean).join(" | ") || "Gemini başarısız");
+  }
+
+  const text = results
+    .map((r, i) =>
+      r.ok
+        ? r.text
+        : `--- SAYFA ${chunks[i].startPage}-${chunks[i].endPage} (OKUNAMADI) ---\n[${r.error}]`
+    )
+    .join("\n\n");
+
+  const failed = results.length - succeeded.length;
+  const truncated = succeeded.some((r) => r.truncated);
+  const model = succeeded[0].model ?? getOcrModels().gemini;
+
+  return {
+    ok: true,
+    text,
+    pageCount: totalPages || undefined,
+    modelUsed: `Gemini ${model} (native PDF${chunks.length > 1 ? `, ${chunks.length} parça` : ""})`,
+    cost: results.reduce((sum, r) => sum + r.cost, 0),
+    warning: joinMessages(
+      failed > 0 ? `⚠️ ${failed}/${chunks.length} bölüm okunamadı, geri kalanı işlendi.` : undefined,
+      truncated ? "⚠️ Belgenin bir kısmı çok uzun olduğu için kesilmiş olabilir." : undefined
+    ),
+  };
+}
+
+function pdfChunkPrompt(chunk: PdfChunk, chunkCount: number, totalPages: number): string {
+  if (chunkCount === 1) {
+    return "Bu PDF belgesinin TÜM sayfalarındaki metni eksiksiz ve birebir çıkar. Her sayfanın başına --- SAYFA N --- yaz.";
+  }
+  return `Bu PDF, toplam ${totalPages} sayfalık bir belgenin ${chunk.startPage}-${chunk.endPage}. sayfalarıdır. Bu bölümdeki TÜM metni eksiksiz ve birebir çıkar. Sayfa işaretlerini gerçek sayfa numaralarıyla yaz: ilk sayfa --- SAYFA ${chunk.startPage} --- olmalı.`;
+}
+
+async function pdfWithClaude(buffer: Buffer, pageCount: number): Promise<EngineOutcome> {
+  const content = [
+    {
+      type: "document",
+      source: { type: "base64", media_type: "application/pdf", data: buffer.toString("base64") },
+    },
+    { type: "text", text: "Bu PDF'in tüm içeriğini eksiksiz ve birebir metne çevir." },
+  ];
+  const maxTokens = Math.min(Math.max((pageCount || 5) * 800, 4000), 16000);
+  const r = await callClaude(content, maxTokens);
+  if (!r.ok) return engineFail(r.error);
+  return {
+    ok: true,
+    text: r.text,
+    modelUsed: `Claude ${r.model} (native PDF)`,
+    cost: r.cost,
+  };
+}
+
+async function pdfWithOpenAI(buffer: Buffer): Promise<EngineOutcome> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return engineFail("OPENAI_API_KEY eksik");
+
+  let pngPages;
+  try {
+    pngPages = await pdfToPng(buffer, { viewportScale: 2.0, useSystemFonts: false });
+  } catch (e) {
+    return engineFail(`PDF→PNG dönüşümü başarısız: ${String(e).slice(0, 150)}`);
+  }
+  if (pngPages.length === 0) return engineFail("PDF→PNG dönüşüm 0 sayfa döndü");
+
+  const model = getOcrModels().openai;
+  const results = await runWithLimit(
+    pngPages.map((page, i) => () =>
+      callOpenAIVision(apiKey, model, page.content as Buffer, "image/png", i + 1, pngPages.length)
+    ),
+    3
+  );
+
+  const failed = results.filter((r) => !r.success).length;
+  if (failed === results.length) {
+    return engineFail(results[0]?.error ?? "GPT Vision hiçbir sayfayı okuyamadı");
+  }
+
+  const text = results
+    .map((r, i) =>
+      r.success
+        ? `--- SAYFA ${i + 1} ---\n\n${r.text}`
+        : `--- SAYFA ${i + 1} (OKUNAMADI) ---\n[${r.error}]`
+    )
+    .join("\n\n");
+
+  return {
+    ok: true,
+    text,
+    pageCount: pngPages.length,
+    modelUsed: `GPT ${model} Vision (${pngPages.length} sayfa)`,
+    cost: results.reduce((sum, r) => sum + (r.cost ?? 0), 0),
+    warning:
+      failed > 0 ? `⚠️ ${failed}/${pngPages.length} sayfa okunamadı. Geri kalanı işlendi.` : undefined,
+  };
 }
 
 // ─────────────────────────────────────────────────────────
-// CLAUDE VISION (Anthropic PDF beta — bazen çalışmıyor)
+// GÖRSEL (JPG/PNG/WEBP/HEIC...)
 // ─────────────────────────────────────────────────────────
 
-async function extractWithClaudeVision(
+async function extractImage(
   buffer: Buffer,
+  mimeType: string,
+  method: ExtractionMethod,
+  startTime: number
+): Promise<ExtractResult> {
+  const image = await prepareImage(buffer, mimeType);
+  const prompt =
+    "Bu görseldeki tüm metni eksiksiz ve birebir çıkar. Tablo varsa markdown, damga/imza/kaşe varsa belirt.";
+
+  const runEngine = async (engine: Engine): Promise<EngineOutcome> => {
+    if (engine === "gemini") {
+      if (!hasGeminiKey()) return engineFail("GEMINI_API_KEY eksik");
+      const r = await geminiOcr({
+        data: image.data,
+        mimeType: image.mimeType,
+        systemPrompt: OCR_SYSTEM_PROMPT,
+        prompt,
+      });
+      return r.ok
+        ? { ok: true, text: r.text, modelUsed: `Gemini ${r.model}`, cost: r.cost }
+        : engineFail(r.error);
+    }
+
+    if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(image.mimeType)) {
+      return engineFail(`${ENGINE_LABEL[engine]} ${image.mimeType} formatını desteklemiyor`);
+    }
+
+    if (engine === "openai") {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) return engineFail("OPENAI_API_KEY eksik");
+      const model = getOcrModels().openai;
+      const r = await callOpenAIVision(apiKey, model, image.data, image.mimeType, 1, 1);
+      return r.success
+        ? { ok: true, text: r.text, modelUsed: `GPT ${model} Vision`, cost: r.cost ?? 0 }
+        : engineFail(r.error);
+    }
+
+    const r = await callClaude(
+      [
+        {
+          type: "image",
+          source: { type: "base64", media_type: image.mimeType, data: image.data.toString("base64") },
+        },
+        { type: "text", text: prompt },
+      ],
+      8000
+    );
+    return r.ok
+      ? { ok: true, text: r.text, modelUsed: `Claude ${r.model} Vision`, cost: r.cost }
+      : engineFail(r.error);
+  };
+
+  if (method === "best_of_3") {
+    return pickBestOf3(await runAllEngines(runEngine), 1, startTime);
+  }
+
+  const result = await runEngineChain(ENGINE_ORDER[method], runEngine, 1, startTime);
+  return result.text ? { ...result, method: `image_${result.method}` } : result;
+}
+
+// ─────────────────────────────────────────────────────────
+// MOTOR ZİNCİRİ / BEST-OF-3
+// ─────────────────────────────────────────────────────────
+
+async function runEngineChain(
+  order: Engine[],
+  runEngine: (engine: Engine) => Promise<EngineOutcome>,
   pageCount: number,
   startTime: number
 ): Promise<ExtractResult> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return errorResult(startTime, "ANTHROPIC_API_KEY eksik", "🔑 Claude API key eksik");
+  const failures: string[] = [];
+  let spent = 0;
+
+  for (const engine of order) {
+    const outcome = await runEngine(engine);
+    spent += outcome.cost;
+    if (outcome.ok && !looksLikeAIFailure(outcome.text)) {
+      const fellBack =
+        engine !== order[0]
+          ? `ℹ️ ${ENGINE_LABEL[order[0]]} okuyamadı, ${ENGINE_LABEL[engine]} ile okundu.`
+          : undefined;
+      return {
+        text: outcome.text.trim(),
+        pageCount: outcome.pageCount ?? pageCount,
+        method: `${engine}_vision`,
+        modelUsed: outcome.modelUsed,
+        usedAI: true,
+        estimatedCost: spent,
+        durationMs: Date.now() - startTime,
+        userMessage: joinMessages(fellBack, outcome.warning),
+      };
+    }
+    failures.push(`${ENGINE_LABEL[engine]}: ${outcome.error ?? "anlamsız çıktı"}`);
+    console.warn(`[OCR] ${ENGINE_LABEL[engine]} başarısız → sonraki motor`, outcome.error);
   }
 
-  const baseURL =
-    process.env.ANTHROPIC_BASE_URL?.replace(/\/$/, "") ||
-    "https://api.anthropic.com";
-  const model =
-    process.env.HARIS_ANALYZER_MODEL?.split(":")[1] ?? "claude-sonnet-4-6";
+  return {
+    ...errorResult(
+      startTime,
+      failures.join(" | "),
+      `❌ Belge hiçbir modelle okunamadı. ${humanizeError(failures[0])}`
+    ),
+    estimatedCost: spent,
+  };
+}
 
-  const maxTokens = Math.min(Math.max((pageCount || 5) * 800, 4000), 16000);
+async function runAllEngines(
+  runEngine: (engine: Engine) => Promise<EngineOutcome>
+): Promise<Array<EngineOutcome & { engine: Engine }>> {
+  const engines: Engine[] = ["gemini", "claude", "openai"];
+  return Promise.all(engines.map(async (engine) => ({ ...(await runEngine(engine)), engine })));
+}
+
+function pickBestOf3(
+  results: Array<EngineOutcome & { engine: Engine }>,
+  pageCount: number,
+  startTime: number
+): ExtractResult {
+  const comparison = results.map((r) => ({
+    model: ENGINE_LABEL[r.engine],
+    chars: r.text.length,
+    cost: r.cost,
+  }));
+  const totalCost = comparison.reduce((sum, c) => sum + c.cost, 0);
+  const valid = results.filter((r) => r.ok && !looksLikeAIFailure(r.text));
+
+  if (valid.length === 0) {
+    return {
+      ...errorResult(
+        startTime,
+        results.map((r) => `${ENGINE_LABEL[r.engine]}: ${r.error}`).join(" | "),
+        "❌ Hiçbir AI okuyamadı. Dosya çok düşük kalite olabilir."
+      ),
+      pageCount,
+      method: "best_of_3",
+      modelUsed: "Best-of-3 (tümü başarısız)",
+      estimatedCost: totalCost,
+      comparison,
+    };
+  }
+
+  const best = valid.reduce((a, b) => (b.text.length > a.text.length ? b : a));
+  return {
+    text: best.text.trim(),
+    pageCount: best.pageCount ?? pageCount,
+    method: "best_of_3",
+    modelUsed: `Best-of-3 → ${best.modelUsed} kazandı`,
+    usedAI: true,
+    estimatedCost: totalCost,
+    durationMs: Date.now() - startTime,
+    comparison,
+    userMessage: best.warning,
+  };
+}
+
+// ─────────────────────────────────────────────────────────
+// SAĞLAYICI ÇAĞRILARI
+// ─────────────────────────────────────────────────────────
+
+async function callClaude(
+  content: unknown[],
+  maxTokens: number
+): Promise<{ ok: true; text: string; model: string; cost: number } | { ok: false; error: string }> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return { ok: false, error: "ANTHROPIC_API_KEY eksik" };
+
+  const baseURL =
+    process.env.ANTHROPIC_BASE_URL?.replace(/\/$/, "") || "https://api.anthropic.com";
+  const model = getOcrModels().claude;
+  let lastError = "";
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 120_000);
+    const timer = setTimeout(() => controller.abort(), 150_000);
     try {
       const res = await fetch(`${baseURL}/v1/messages`, {
         method: "POST",
@@ -233,186 +534,69 @@ async function extractWithClaudeVision(
           "Content-Type": "application/json",
           "x-api-key": apiKey,
           "anthropic-version": "2023-06-01",
-          "anthropic-beta": "pdfs-2024-09-25",
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
           model,
           max_tokens: maxTokens,
-          system: TURKISH_OCR_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "document",
-                  source: {
-                    type: "base64",
-                    media_type: "application/pdf",
-                    data: buffer.toString("base64"),
-                  },
-                },
-                { type: "text", text: "Bu PDF'in tüm içeriğini Türkçe metne çevir." },
-              ],
-            },
-          ],
+          system: OCR_SYSTEM_PROMPT,
+          messages: [{ role: "user", content }],
         }),
       });
-      clearTimeout(tid);
 
       if (!res.ok) {
-        const errText = await res.text();
+        lastError = `Claude HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`;
         if (attempt < 3 && (res.status === 429 || res.status >= 500)) {
           await sleep(1000 * 2 ** attempt);
           continue;
         }
-        return errorResult(
-          startTime,
-          `Claude HTTP ${res.status}: ${errText.slice(0, 200)}`,
-          humanizeError(`HTTP ${res.status}`)
-        );
+        return { ok: false, error: lastError };
       }
 
       const data = await res.json();
-      const text = Array.isArray(data.content)
+      const text: string = Array.isArray(data.content)
         ? data.content
             .filter((c: { type: string }) => c.type === "text")
             .map((c: { text: string }) => c.text)
             .join("\n")
         : "";
+      if (text.trim().length < 5) return { ok: false, error: "Claude boş yanıt" };
 
-      if (looksLikeAIFailure(text)) {
-        // Claude PDF beta çalışmadı → OpenAI Vision'a düş
-        console.log("[Claude Vision boş yanıt → OpenAI Vision fallback]");
-        return extractWithOpenAIVision(buffer, pageCount, startTime);
-      }
-
-      const ti = data.usage?.input_tokens || 0;
-      const to = data.usage?.output_tokens || 0;
-      const cost = (ti * 3 + to * 15) / 1_000_000;
-
+      const inputTokens = data.usage?.input_tokens || 0;
+      const outputTokens = data.usage?.output_tokens || 0;
       return {
+        ok: true,
         text: text.trim(),
-        pageCount,
-        method: "claude_vision",
-        modelUsed: "Claude Sonnet 4.6 Vision",
-        usedAI: true,
-        estimatedCost: cost,
-        durationMs: Date.now() - startTime,
+        model,
+        cost: (inputTokens * 3 + outputTokens * 15) / 1_000_000,
       };
     } catch (e) {
-      clearTimeout(tid);
+      lastError = `Claude: ${String(e).slice(0, 150)}`;
       if (attempt < 3) {
         await sleep(1000 * 2 ** attempt);
         continue;
       }
-      return errorResult(startTime, String(e), humanizeError(String(e)));
+    } finally {
+      clearTimeout(timer);
     }
   }
-  return errorResult(startTime, "Tüm retry'lar tükendi", "❌ Claude Vision başarısız");
+  return { ok: false, error: lastError || "Claude başarısız" };
 }
 
-// ─────────────────────────────────────────────────────────
-// OPENAI VISION — PDF → PNG → GPT-4o (kanıtlanmış pipeline)
-// ─────────────────────────────────────────────────────────
-
-async function extractWithOpenAIVision(
-  buffer: Buffer,
-  pageCount: number,
-  startTime: number
-): Promise<ExtractResult> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return errorResult(startTime, "OPENAI_API_KEY eksik", "🔑 OpenAI API key eksik");
-  }
-
-  try {
-    // PDF → PNG sayfaları (Windows path fix — mutlak path olarak options ver)
-    let pngPages;
-    try {
-      pngPages = await pdfToPng(buffer, {
-        viewportScale: 2.0,
-        useSystemFonts: false,
-      });
-    } catch (pngErr) {
-      const errStr = String(pngErr);
-      // Windows cmaps trailing slash bug — Claude Vision fallback
-      if (errStr.includes("Invalid factory url") || errStr.includes("cmaps")) {
-        console.warn("[PDF→PNG Windows bug, Claude native PDF'e fallback]");
-        return extractWithClaudeVision(buffer, pageCount, startTime);
-      }
-      throw pngErr;
-    }
-
-    if (pngPages.length === 0) {
-      return errorResult(startTime, "PDF→PNG dönüşüm 0 sayfa döndü", "📄 PDF işlenemedi");
-    }
-
-    // Her sayfa için GPT-4o Vision (paralel, max 3)
-    const model = process.env.HARIS_VISION_MODEL?.split(":")[1] ?? "gpt-4o";
-    const tasks = pngPages.map((page, i) => async () => {
-      return callOpenAIVisionPage(
-        apiKey,
-        model,
-        page.content as Buffer,
-        i + 1,
-        pngPages.length
-      );
-    });
-    const results = await runWithLimit(tasks, 3);
-
-    // Birleştir
-    let combinedText = "";
-    let totalCost = 0;
-    let failedPages = 0;
-    results.forEach((r, i) => {
-      if (r.success) {
-        combinedText += `\n\n--- SAYFA ${i + 1} ---\n\n${r.text}`;
-        totalCost += r.cost || 0;
-      } else {
-        failedPages++;
-        combinedText += `\n\n--- SAYFA ${i + 1} (BAŞARISIZ) ---\n[${r.error}]`;
-      }
-    });
-
-    if (combinedText.length < 30) {
-      return errorResult(
-        startTime,
-        "Tüm sayfalar başarısız",
-        "❌ GPT-4o Vision hiçbir sayfayı okuyamadı"
-      );
-    }
-
-    return {
-      text: combinedText.trim(),
-      pageCount: pngPages.length,
-      method: "openai_vision",
-      modelUsed: `GPT-4o Vision (${pngPages.length} sayfa)`,
-      usedAI: true,
-      estimatedCost: totalCost,
-      durationMs: Date.now() - startTime,
-      userMessage:
-        failedPages > 0
-          ? `⚠️ ${failedPages}/${pngPages.length} sayfa okunamadı. Geri kalanı işlendi.`
-          : undefined,
-    };
-  } catch (e) {
-    return errorResult(startTime, String(e), humanizeError(String(e)));
-  }
-}
-
-async function callOpenAIVisionPage(
+async function callOpenAIVision(
   apiKey: string,
   model: string,
-  pngBuffer: Buffer,
+  imageBuffer: Buffer,
+  mimeType: string,
   pageNum: number,
   totalPages: number
 ): Promise<{ success: boolean; text: string; cost?: number; error?: string }> {
-  const base64 = pngBuffer.toString("base64");
+  const base64 = imageBuffer.toString("base64");
+  const usesCompletionTokens = /^(gpt-5|o1|o3|o4)/.test(model);
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 90_000);
+    const timer = setTimeout(() => controller.abort(), 90_000);
     try {
       const res = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -423,28 +607,25 @@ async function callOpenAIVisionPage(
         },
         body: JSON.stringify({
           model,
-          ...(model.startsWith("gpt-5") || model.startsWith("o1") || model.startsWith("o3")
-            ? { max_completion_tokens: 4000 }
-            : { max_tokens: 4000 }),
+          ...(usesCompletionTokens ? { max_completion_tokens: 8000 } : { max_tokens: 4000 }),
           messages: [
-            { role: "system", content: TURKISH_OCR_SYSTEM_PROMPT },
+            { role: "system", content: OCR_SYSTEM_PROMPT },
             {
               role: "user",
               content: [
                 {
                   type: "text",
-                  text: `Sayfa ${pageNum}/${totalPages}. Bu görseldeki tüm metni Türkçe olarak çıkar. Tablo, grafik, damga, imza varsa belirt.`,
+                  text: `Sayfa ${pageNum}/${totalPages}. Bu görseldeki tüm metni birebir çıkar. Tablo, grafik, damga, imza varsa belirt.`,
                 },
                 {
                   type: "image_url",
-                  image_url: { url: `data:image/png;base64,${base64}` },
+                  image_url: { url: `data:${mimeType};base64,${base64}`, detail: "high" },
                 },
               ],
             },
           ],
         }),
       });
-      clearTimeout(tid);
 
       if (!res.ok) {
         const errText = await res.text();
@@ -455,331 +636,34 @@ async function callOpenAIVisionPage(
         return {
           success: false,
           text: "",
-          error: `GPT-4o HTTP ${res.status}: ${errText.slice(0, 100)}`,
+          error: `GPT HTTP ${res.status}: ${errText.slice(0, 150)}`,
         };
       }
 
       const data = await res.json();
-      const text = data.choices?.[0]?.message?.content ?? "";
-      const ti = data.usage?.prompt_tokens || 0;
-      const to = data.usage?.completion_tokens || 0;
-      const cost = (ti * 2.5 + to * 10) / 1_000_000;
+      const text: string = data.choices?.[0]?.message?.content ?? "";
+      const inputTokens = data.usage?.prompt_tokens || 0;
+      const outputTokens = data.usage?.completion_tokens || 0;
 
       if (!text || text.length < 5) {
         return { success: false, text: "", error: "Boş yanıt" };
       }
-
-      return { success: true, text, cost };
+      return {
+        success: true,
+        text,
+        cost: (inputTokens * 2.5 + outputTokens * 10) / 1_000_000,
+      };
     } catch (e) {
-      clearTimeout(tid);
       if (attempt < 3) {
         await sleep(1000 * 2 ** attempt);
         continue;
       }
       return { success: false, text: "", error: String(e).slice(0, 100) };
+    } finally {
+      clearTimeout(timer);
     }
   }
   return { success: false, text: "", error: "Tüm retry'lar tükendi" };
-}
-
-// ─────────────────────────────────────────────────────────
-// GEMINI VISION — PDF → PNG → Gemini Pro Vision
-// ─────────────────────────────────────────────────────────
-
-async function extractWithGeminiVision(
-  buffer: Buffer,
-  pageCount: number,
-  startTime: number
-): Promise<ExtractResult> {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  if (!apiKey) {
-    return errorResult(
-      startTime,
-      "GEMINI_API_KEY eksik",
-      "🔑 Gemini API key eksik (.env.local'a GEMINI_API_KEY ekleyin)"
-    );
-  }
-
-  const baseURL =
-    process.env.GEMINI_BASE_URL?.replace(/\/$/, "") ||
-    "https://generativelanguage.googleapis.com/v1beta";
-  const model = process.env.HARIS_GEMINI_MODEL || "gemini-2.0-flash-exp";
-
-  try {
-    let pngPages;
-    try {
-      pngPages = await pdfToPng(buffer, {
-        viewportScale: 2.0,
-        useSystemFonts: false,
-      });
-    } catch (pngErr) {
-      const errStr = String(pngErr);
-      if (errStr.includes("Invalid factory url") || errStr.includes("cmaps")) {
-        console.warn("[PDF→PNG Windows bug (Gemini), Claude native PDF'e fallback]");
-        return extractWithClaudeVision(buffer, pageCount, startTime);
-      }
-      throw pngErr;
-    }
-    if (pngPages.length === 0) {
-      return errorResult(startTime, "PDF→PNG 0 sayfa", "📄 PDF işlenemedi");
-    }
-
-    const tasks = pngPages.map((page, i) => async () => {
-      return callGeminiVisionPage(
-        apiKey,
-        baseURL,
-        model,
-        page.content as Buffer,
-        i + 1,
-        pngPages.length
-      );
-    });
-    const results = await runWithLimit(tasks, 3);
-
-    let combinedText = "";
-    let totalCost = 0;
-    let failedPages = 0;
-    results.forEach((r, i) => {
-      if (r.success) {
-        combinedText += `\n\n--- SAYFA ${i + 1} ---\n\n${r.text}`;
-        totalCost += r.cost || 0;
-      } else {
-        failedPages++;
-        combinedText += `\n\n--- SAYFA ${i + 1} (BAŞARISIZ) ---\n[${r.error}]`;
-      }
-    });
-
-    if (combinedText.length < 30) {
-      return errorResult(
-        startTime,
-        "Tüm sayfalar başarısız",
-        "❌ Gemini Vision hiçbir sayfayı okuyamadı"
-      );
-    }
-
-    return {
-      text: combinedText.trim(),
-      pageCount: pngPages.length,
-      method: "gemini_vision",
-      modelUsed: `Gemini ${model} (${pngPages.length} sayfa)`,
-      usedAI: true,
-      estimatedCost: totalCost,
-      durationMs: Date.now() - startTime,
-      userMessage:
-        failedPages > 0
-          ? `⚠️ ${failedPages}/${pngPages.length} sayfa okunamadı.`
-          : undefined,
-    };
-  } catch (e) {
-    return errorResult(startTime, String(e), humanizeError(String(e)));
-  }
-}
-
-async function callGeminiVisionPage(
-  apiKey: string,
-  baseURL: string,
-  model: string,
-  pngBuffer: Buffer,
-  pageNum: number,
-  totalPages: number
-): Promise<{ success: boolean; text: string; cost?: number; error?: string }> {
-  const base64 = pngBuffer.toString("base64");
-  const url = `${baseURL}/models/${model}:generateContent?key=${apiKey}`;
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 90_000);
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        signal: controller.signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: TURKISH_OCR_SYSTEM_PROMPT }] },
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: `Sayfa ${pageNum}/${totalPages}. Bu görseldeki tüm metni Türkçe olarak çıkar. Tablo varsa markdown, grafik varsa [GRAFİK: ...] olarak belirt.`,
-                },
-                {
-                  inlineData: {
-                    mimeType: "image/png",
-                    data: base64,
-                  },
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 4000,
-          },
-        }),
-      });
-      clearTimeout(tid);
-
-      if (!res.ok) {
-        const errText = await res.text();
-        if (attempt < 3 && (res.status === 429 || res.status >= 500)) {
-          await sleep(1000 * 2 ** attempt);
-          continue;
-        }
-        return {
-          success: false,
-          text: "",
-          error: `Gemini HTTP ${res.status}: ${errText.slice(0, 100)}`,
-        };
-      }
-
-      const data = await res.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-      const ti = data.usageMetadata?.promptTokenCount || 0;
-      const to = data.usageMetadata?.candidatesTokenCount || 0;
-      // Gemini 2.0 Flash: ~$0.10/M in, $0.40/M out
-      const cost = (ti * 0.1 + to * 0.4) / 1_000_000;
-
-      if (!text || text.length < 5) {
-        return { success: false, text: "", error: "Boş yanıt" };
-      }
-
-      return { success: true, text, cost };
-    } catch (e) {
-      clearTimeout(tid);
-      if (attempt < 3) {
-        await sleep(1000 * 2 ** attempt);
-        continue;
-      }
-      return { success: false, text: "", error: String(e).slice(0, 100) };
-    }
-  }
-  return { success: false, text: "", error: "Retry tükendi" };
-}
-
-// ─────────────────────────────────────────────────────────
-// BEST OF 3 — Paralel 3 model, en uzun ve anlamlı çıktıyı seç
-// ─────────────────────────────────────────────────────────
-
-async function extractBestOf3(
-  buffer: Buffer,
-  pageCount: number,
-  startTime: number
-): Promise<ExtractResult> {
-  const tasks = [
-    () =>
-      extractWithClaudeVision(buffer, pageCount, startTime).then((r) => ({
-        ...r,
-        modelLabel: "Claude",
-      })),
-    () =>
-      extractWithOpenAIVision(buffer, pageCount, startTime).then((r) => ({
-        ...r,
-        modelLabel: "GPT-4o",
-      })),
-    () =>
-      extractWithGeminiVision(buffer, pageCount, startTime).then((r) => ({
-        ...r,
-        modelLabel: "Gemini",
-      })),
-  ];
-
-  const results = await Promise.all(tasks.map((t) => t()));
-
-  // En anlamlı çıktıyı seç: hata olmayan + en uzun
-  const valid = results.filter(
-    (r) => r.text && r.text.length > 50 && !looksLikeAIFailure(r.text)
-  );
-
-  const comparison = results.map((r) => ({
-    model: r.modelLabel,
-    chars: r.text?.length || 0,
-    cost: r.estimatedCost || 0,
-  }));
-
-  if (valid.length === 0) {
-    return {
-      text: results[1].text || results[0].text || results[2].text || "",
-      pageCount,
-      method: "best_of_3",
-      modelUsed: "Best-of-3 (tümü başarısız)",
-      usedAI: true,
-      estimatedCost: comparison.reduce((s, c) => s + c.cost, 0),
-      durationMs: Date.now() - startTime,
-      comparison,
-      error: "Tüm 3 model başarısız",
-      userMessage: "❌ Hiçbir AI okuyamadı. Dosya çok düşük kalite olabilir.",
-    };
-  }
-
-  // En uzun çıktıyı seç (genelde en kapsamlı)
-  const best = valid.reduce((a, b) =>
-    (b.text?.length || 0) > (a.text?.length || 0) ? b : a
-  );
-
-  return {
-    text: best.text,
-    pageCount,
-    method: "best_of_3",
-    modelUsed: `Best-of-3 → ${best.modelLabel} kazandı`,
-    usedAI: true,
-    estimatedCost: comparison.reduce((s, c) => s + c.cost, 0),
-    durationMs: Date.now() - startTime,
-    comparison,
-  };
-}
-
-// ─────────────────────────────────────────────────────────
-// GÖRSEL (JPG/PNG)
-// ─────────────────────────────────────────────────────────
-
-async function extractImageWithMethod(
-  buffer: Buffer,
-  mimeType: string,
-  method: ExtractionMethod,
-  startTime: number
-): Promise<ExtractResult> {
-  // Görsel için PNG conversion gereksiz, doğrudan vision'a yolla
-  const apiKey = process.env.OPENAI_API_KEY;
-
-  // gemini_vision seçilmişse Gemini'ye yolla
-  if (method === "gemini_vision") {
-    const geminiKey =
-      process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-    if (geminiKey) {
-      const baseURL =
-        process.env.GEMINI_BASE_URL?.replace(/\/$/, "") ||
-        "https://generativelanguage.googleapis.com/v1beta";
-      const model = process.env.HARIS_GEMINI_MODEL || "gemini-2.0-flash-exp";
-      const r = await callGeminiVisionPage(geminiKey, baseURL, model, buffer, 1, 1);
-      return {
-        text: r.text,
-        method: "image_gemini",
-        modelUsed: `Gemini ${model}`,
-        usedAI: true,
-        estimatedCost: r.cost,
-        durationMs: Date.now() - startTime,
-        error: r.success ? undefined : r.error,
-        userMessage: r.success ? undefined : humanizeError(r.error),
-      };
-    }
-  }
-
-  if (!apiKey) {
-    return errorResult(startTime, "OPENAI_API_KEY eksik", "🔑 OpenAI key eksik");
-  }
-  const model = process.env.HARIS_VISION_MODEL?.split(":")[1] ?? "gpt-4o";
-  const r = await callOpenAIVisionPage(apiKey, model, buffer, 1, 1);
-  return {
-    text: r.text,
-    method: "image_ocr",
-    modelUsed: "GPT-4o Vision",
-    usedAI: true,
-    estimatedCost: r.cost,
-    durationMs: Date.now() - startTime,
-    error: r.success ? undefined : r.error,
-    userMessage: r.success ? undefined : humanizeError(r.error),
-  };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -832,41 +716,45 @@ async function extractUdf(buffer: Buffer, startTime: number): Promise<ExtractRes
 // HELPERS
 // ─────────────────────────────────────────────────────────
 
-const TURKISH_OCR_SYSTEM_PROMPT = `Sen profesyonel Türk hukuk belge OCR uzmanısın. Türkçe karakterleri (ç, ğ, ı, ö, ş, ü, İ, Ç, Ğ, Ş, Ö, Ü) HATASIZ koru. ASLA Arapça, Farsça, İbranice veya başka alfabe ekleme.
-
-KURALLAR:
-1. Sadece belgedeki metni döndür, kendi yorumun YOK
-2. Tabloları Markdown table formatında (| sütun | sütun |) yaz
-3. Grafikleri açıkla: [GRAFİK: kısa açıklama]
-4. Damga/imza/kaşeyi belirt: [DAMGA] [İMZA] [KAŞE]
-5. Sayfa numarası: --- SAYFA N ---
-6. Paragraf yapısı, madde numaraları, listeler korunmalı
-7. Mahkeme adı, esas no, tarih en üste`;
+function guessImageMime(lowerFilename: string): string {
+  if (/\.jpe?g$/.test(lowerFilename)) return "image/jpeg";
+  if (lowerFilename.endsWith(".webp")) return "image/webp";
+  if (/\.hei[cf]$/.test(lowerFilename)) return "image/heic";
+  if (/\.tiff?$/.test(lowerFilename)) return "image/tiff";
+  if (lowerFilename.endsWith(".bmp")) return "image/bmp";
+  if (lowerFilename.endsWith(".gif")) return "image/gif";
+  return "image/png";
+}
 
 function looksLikeAIFailure(text: string): boolean {
   if (!text || text.length < 30) return true;
   const lower = text.toLowerCase();
+  if (text.length > 1500) return false;
   return (
-    /pdf.{0,30}(boş|empty|okunamı|cannot|unable|unsupported|içerik.{0,10}çıkarıla)/i.test(
-      text
-    ) ||
+    /pdf.{0,30}(boş|empty|okunamı|cannot|unable|unsupported|içerik.{0,10}çıkarıla)/i.test(text) ||
     /(belge|dosya).{0,30}(çıkarıla|okunamı|boş.{0,5}görün)/i.test(text) ||
     (lower.includes("dosyayı paylaşabildiğin") && text.length < 600) ||
     (lower.includes("sorry") && text.length < 300)
   );
 }
 
+function engineFail(error?: string): EngineOutcome {
+  return { ok: false, text: "", modelUsed: "", cost: 0, error: error ?? "bilinmeyen hata" };
+}
+
+function joinMessages(...messages: Array<string | undefined>): string | undefined {
+  const joined = messages.filter(Boolean).join(" ");
+  return joined || undefined;
+}
+
 async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function runWithLimit<T>(
-  tasks: (() => Promise<T>)[],
-  limit: number
-): Promise<T[]> {
+async function runWithLimit<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
-  const queue = tasks.map((t, i) => ({ task: t, index: i }));
-  const workers = Array.from({ length: limit }, async () => {
+  const queue = tasks.map((task, index) => ({ task, index }));
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
     while (queue.length > 0) {
       const item = queue.shift();
       if (!item) break;
@@ -879,24 +767,19 @@ async function runWithLimit<T>(
 
 function humanizeError(err?: string): string {
   if (!err) return "Bilinmeyen hata";
+  if (err.includes("eksik")) return err;
   if (err.includes("fetch failed")) return "İnternet bağlantısı koptu";
   if (err.includes("timeout") || err.includes("aborted"))
-    return "İşlem çok uzun sürdü (90s+), dosya çok karmaşık olabilir";
+    return "İşlem çok uzun sürdü, dosya çok büyük veya karmaşık olabilir";
   if (err.includes("429") || err.includes("rate limit"))
     return "API rate limit — birkaç dakika bekleyin";
-  if (err.includes("401") || err.includes("403"))
-    return "API key geçersiz";
-  if (err.includes("503") || err.includes("502"))
-    return "AI sunucusu geçici hizmet dışı";
-  if (err.includes("Arapça")) return "AI yanlış dilde çıktı, tekrar deneyin";
+  if (err.includes("401") || err.includes("403")) return "API key geçersiz";
+  if (err.includes("404")) return "OCR modeli bulunamadı (HARIS_OCR_MODEL ayarını kontrol edin)";
+  if (err.includes("503") || err.includes("502")) return "AI sunucusu geçici hizmet dışı";
   return err.slice(0, 150);
 }
 
-function errorResult(
-  startTime: number,
-  techError: string,
-  userMsg: string
-): ExtractResult {
+function errorResult(startTime: number, techError: string, userMsg: string): ExtractResult {
   return {
     text: "",
     method: "fallback",

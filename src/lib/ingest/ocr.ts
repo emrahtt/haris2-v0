@@ -16,10 +16,12 @@
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { hasOpenAI, isAiDemoMode } from "@/lib/ai/config";
+import { geminiOcr, hasGeminiKey } from "@/lib/v2/ingest/gemini-ocr";
+import { prepareImage } from "@/lib/v2/ingest/image-prep";
 
 interface OcrResult {
   text: string;
-  method: "gpt-4o-vision" | "heuristic-demo";
+  method: "gemini-vision" | "gpt-4o-vision" | "heuristic-demo";
   confidence: "high" | "medium" | "low";
   warnings: string[];
 }
@@ -215,6 +217,25 @@ export async function performOcr(
   mimeType: string,
   fileName: string
 ): Promise<OcrResult> {
+  if (hasGeminiKey()) {
+    const prepared = await prepareImage(imageBuffer, mimeType);
+    const gemini = await geminiOcr({
+      data: prepared.data,
+      mimeType: prepared.mimeType,
+      systemPrompt: OCR_SYSTEM_PROMPT,
+      prompt: "Bu görseldeki tüm metni titizlikle çıkar:",
+    });
+    if (gemini.ok) {
+      return {
+        text: gemini.text,
+        method: "gemini-vision",
+        confidence: gemini.text.length > 100 ? "high" : "medium",
+        warnings: gemini.text.includes("[okunamadı]") ? ["Bazı bölümler okunamadı"] : [],
+      };
+    }
+    console.warn("[ocr] Gemini başarısız, GPT-4o'ya geçiliyor:", gemini.error);
+  }
+
   if (!isAiDemoMode && hasOpenAI) {
     try {
       const result = await ocrWithGpt4oVision(imageBuffer, mimeType);

@@ -16,6 +16,7 @@ export type ModelRole =
   | "opposition" // YENİ: Karşı Argüman için (GPT-5.6 Sol)
   | "drafter"
   | "quick"
+  // Görsel ANALİZ (yorum). Belgeden metin çıkarma (OCR) bu rolü kullanmaz → ingest/ocr-config.ts
   | "vision";
 
 export interface ModelInfo {

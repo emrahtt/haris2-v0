@@ -4,6 +4,9 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { isDemoMode } from "@/lib/supabase/config";
+import { safeInternalPath } from "@/lib/flow/steps";
+
+const APP_HOME = "/v2";
 
 /**
  * Giriş yap (Server Action — form action olarak kullanılır).
@@ -15,6 +18,7 @@ import { isDemoMode } from "@/lib/supabase/config";
 export async function signIn(formData: FormData): Promise<void> {
   const email = formData.get("email") as string;
   const password = formData.get("password") as string;
+  const next = safeInternalPath(formData.get("next"), APP_HOME);
 
   if (isDemoMode) {
     const cookieStore = await cookies();
@@ -23,7 +27,7 @@ export async function signIn(formData: FormData): Promise<void> {
       maxAge: 60 * 60 * 24 * 7,
       path: "/",
     });
-    redirect("/dashboard");
+    redirect(next);
   }
 
   const supabase = await createClient();
@@ -32,10 +36,11 @@ export async function signIn(formData: FormData): Promise<void> {
   const { error } = await supabase.auth.signInWithPassword({ email, password });
 
   if (error) {
-    redirect(`/login?error=${encodeURIComponent(error.message)}`);
+    const nextParam = next === APP_HOME ? "" : `&next=${encodeURIComponent(next)}`;
+    redirect(`/login?error=${encodeURIComponent(error.message)}${nextParam}`);
   }
 
-  redirect("/dashboard");
+  redirect(next);
 }
 
 export async function signUp(formData: FormData): Promise<void> {
@@ -50,7 +55,7 @@ export async function signUp(formData: FormData): Promise<void> {
       maxAge: 60 * 60 * 24 * 7,
       path: "/",
     });
-    redirect("/dashboard");
+    redirect(APP_HOME);
   }
 
   const supabase = await createClient();
@@ -76,8 +81,8 @@ export async function signUp(formData: FormData): Promise<void> {
     );
   }
 
-  // Session var → direkt dashboard
-  redirect("/dashboard");
+  // Session var → akışın başlangıcı
+  redirect(APP_HOME);
 }
 
 export async function signOut(): Promise<void> {

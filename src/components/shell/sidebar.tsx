@@ -6,6 +6,7 @@ import { Logo } from "@/components/ui/logo";
 import { signOut } from "@/lib/auth-actions";
 import { DEMO_USER } from "@/lib/supabase/config";
 import {
+  Compass,
   Home,
   Folder,
   Users,
@@ -29,6 +30,7 @@ const SECTIONS: { label: string; items: NavItem[] }[] = [
   {
     label: "Ana",
     items: [
+      { href: "/v2", label: "Başlangıç", icon: Compass },
       { href: "/dashboard", label: "Gösterge Paneli", icon: Home },
       { href: "/cases", label: "Davalarım", icon: Folder, badge: "6" },
       { href: "/agents", label: "AI Ajan Paneli", icon: Users, badge: "Canlı" },
@@ -57,7 +59,7 @@ export function Sidebar() {
   return (
     <aside className="hidden md:flex bg-[var(--color-bg-1)] border-r border-[var(--color-line)] px-4 py-5 flex-col sticky top-0 h-screen overflow-y-auto w-[260px]">
       <div className="px-2 pb-5 border-b border-[var(--color-line)] mb-4">
-        <Link href="/dashboard">
+        <Link href="/v2" aria-label="HARIS başlangıç">
           <Logo size="sm" />
         </Link>
       </div>

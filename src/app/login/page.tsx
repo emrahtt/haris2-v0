@@ -3,14 +3,16 @@ import { Logo } from "@/components/ui/logo";
 import { Button } from "@/components/ui/button";
 import { signIn } from "@/lib/auth-actions";
 import { isDemoMode } from "@/lib/supabase/config";
+import { safeInternalPath } from "@/lib/flow/steps";
 import { ArrowRight, AlertCircle, CheckCircle2 } from "lucide-react";
 
 interface Props {
-  searchParams: Promise<{ error?: string; message?: string }>;
+  searchParams: Promise<{ error?: string; message?: string; next?: string }>;
 }
 
 export default async function LoginPage({ searchParams }: Props) {
   const sp = await searchParams;
+  const next = safeInternalPath(sp.next);
   const errorMsg = sp.error;
   const successMsg = sp.message;
 
@@ -47,6 +49,7 @@ export default async function LoginPage({ searchParams }: Props) {
       {/* Sağ — form */}
       <div className="flex items-center justify-center p-10">
         <form action={signIn} className="w-full max-w-md">
+          <input type="hidden" name="next" value={next} />
           <h2 className="text-[28px] mb-2">Tekrar hoş geldiniz</h2>
           <p className="text-[var(--color-text-2)] text-sm mb-8">Hesabınıza giriş yapın</p>
 

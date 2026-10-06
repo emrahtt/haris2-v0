@@ -38,7 +38,7 @@ export function Hero() {
       </p>
 
       <div className="flex gap-3.5 justify-center flex-wrap">
-        <Link href="/dashboard">
+        <Link href="/v2">
           <Button variant="primary" size="lg">
             <Sparkles size={16} /> Ücretsiz Demoya Başla
           </Button>

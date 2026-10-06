@@ -7,6 +7,7 @@ import { VaultPanel } from "@/components/v2/vault/vault-panel";
 import { WorkflowViewer } from "@/components/v2/workflow/workflow-viewer";
 import { OrchestratorChat } from "@/components/v2/chat/orchestrator-chat";
 import { PetitionCanvas } from "@/components/v2/canvas/petition-canvas";
+import { WorkspaceNextStep } from "@/components/flow/workspace-next-step";
 import { CheckpointDialog } from "@/components/v2/workflow/checkpoint-dialog";
 import { QualityGateView } from "@/components/v2/canvas/quality-gate-view";
 import { WorkspaceSettingsPanel } from "@/components/v2/settings/workspace-settings-panel";
@@ -708,6 +709,18 @@ export function WorkspaceClient({
             </span>
           )}
         </div>
+        <WorkspaceNextStep
+          workspaceId={workspaceId}
+          orchestrationStatus={orchestraStatus}
+          documentsCount={documents.length}
+          hasPetition={Boolean(petition?.markdown)}
+          onAddDocuments={() => fileInputRef.current?.click()}
+          onStart={startOrchestration}
+          onOpenCheckpoint={() => {
+            const pending = checkpoints.find((c) => !c.resolvedAt);
+            if (pending) setOpenCheckpointId(pending.id);
+          }}
+        />
       </div>
 
       <ThreePanelLayout

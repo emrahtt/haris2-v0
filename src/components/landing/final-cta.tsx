@@ -21,7 +21,7 @@ export function FinalCTA() {
           30 gün ücretsiz dene. Kredi kartı gerektirmez. İlk davanı yükle, farkı kendi
           gözlerinle gör.
         </p>
-        <Link href="/dashboard">
+        <Link href="/v2">
           <Button variant="primary" size="lg">
             <Sparkles size={16} /> Demoya Başla
           </Button>

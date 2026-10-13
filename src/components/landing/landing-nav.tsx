@@ -39,7 +39,7 @@ export function LandingNav() {
             Giriş
           </Button>
         </Link>
-        <Link href="/dashboard">
+        <Link href="/v2">
           <Button variant="primary" size="sm">
             Demoyu Dene <ArrowRight size={14} />
           </Button>

@@ -83,7 +83,7 @@ export function AdminShell({
             <span className="text-[10px]">{admin.email}</span>
           </div>
           <Link
-            href="/dashboard"
+            href="/v2"
             className="flex items-center gap-2 px-3 py-2 rounded-md text-[12px] text-[var(--color-text-2)] hover:bg-[var(--color-bg-2)] hover:text-[var(--color-text)]"
           >
             <ArrowLeft size={14} />

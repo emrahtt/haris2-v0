@@ -10,6 +10,8 @@
 import { uuid } from "@/lib/v2/utils/uuid";
 import { useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { FlowStepper } from "@/components/flow/flow-stepper";
 
 interface PendingFile {
   id: string;
@@ -133,12 +135,16 @@ export default function NewWorkspacePage() {
   return (
     <div className="max-w-4xl mx-auto px-6 py-10">
       <div className="mb-8">
-        <button
-          onClick={() => router.back()}
-          className="text-sm text-slate-400 hover:text-slate-200 mb-4"
+        <Link
+          href="/v2"
+          className="inline-block text-sm text-slate-400 hover:text-slate-200 mb-6"
         >
-          ← Geri
-        </button>
+          ← Başlangıç
+        </Link>
+        <FlowStepper
+          current={files.length > 0 ? "documents" : "open"}
+          className="mb-8"
+        />
         <h1
           className="text-3xl font-bold mb-2"
           style={{ fontFamily: "'Playfair Display', Georgia, serif" }}

@@ -1,12 +1,17 @@
 /**
- * HARIS v2 — Landing / Workspace listesi
- * Sprint 11.2: Gerçek API'dan veri çeker.
+ * HARIS — Başlangıç (tek giriş noktası)
+ * Kullanıcıya önce "sıradaki adım"ı, sonra dosyalarını, en sonda
+ * doğrudan geçiş kısayollarını gösterir.
  */
 
 import Link from "next/link";
+import { Plus } from "lucide-react";
 import { getCurrentUserId } from "@/lib/v2/workspace/auth";
 import { listWorkspaces } from "@/lib/v2/workspace/db";
 import { isDemoMode } from "@/lib/supabase/config";
+import { resolveHomeAction, resolveWorkspaceAction, NEW_WORKSPACE_HREF } from "@/lib/flow/steps";
+import { NextStepCard } from "@/components/flow/next-step-card";
+import { SectionShortcuts } from "@/components/flow/section-shortcuts";
 
 export const dynamic = "force-dynamic";
 
@@ -22,118 +27,89 @@ function formatRelativeTr(iso: string): string {
   return new Date(iso).toLocaleDateString("tr-TR");
 }
 
+const STATUS_LABEL: Record<string, string> = {
+  active: "Aktif",
+  completed: "Tamamlandı",
+  archived: "Arşiv",
+  draft: "Taslak",
+};
+
 export default async function V2Home() {
   const userId = await getCurrentUserId();
   const workspaces = await listWorkspaces(userId);
+  const { action, workspaceId } = resolveHomeAction(workspaces);
+  const currentWorkspace = workspaces.find((w) => w.id === workspaceId);
 
   return (
-    <div className="max-w-7xl mx-auto px-6 py-10">
-      <div className="mb-10">
-        <h1
-          className="text-4xl font-bold mb-3"
-          style={{ fontFamily: "'Playfair Display', Georgia, serif" }}
-        >
-          Matter Workspace
+    <div className="mx-auto flex max-w-6xl flex-col gap-10 px-6 py-10">
+      <header className="flex flex-col gap-2">
+        <h1 className="text-balance font-serif text-3xl text-[var(--color-text)] md:text-4xl">
+          {workspaces.length === 0 ? "Hoş geldiniz" : "Kaldığınız yerden devam edin"}
         </h1>
-        <p className="text-slate-400 text-lg max-w-2xl">
-          Her dava bir <em>workspace</em>. 12 uzman AI ajan, Orkestra Şefi
-          koordinasyonunda, sizinle birlikte çalışır.
+        <p className="max-w-2xl text-pretty leading-relaxed text-[var(--color-text-2)]">
+          Her dava beş adımda ilerler: dosya açın, belgeleri ekleyin, analizi başlatın,
+          dilekçeyi inceleyin ve süreleri takip edin. HARIS size her seferinde sıradaki adımı gösterir.
         </p>
-        <Link
-          href="/v2/analytics"
-          className="inline-block mt-3 text-sm text-[#C9A961] hover:underline"
-        >
-          Maliyet ve ajan paneli →
-        </Link>
-      </div>
+      </header>
 
-      <Link
-        href="/v2/workspaces/new"
-        className="block mb-8 p-8 rounded-2xl border-2 border-dashed border-[#C9A961]/30 hover:border-[#C9A961] hover:bg-[#C9A961]/5 transition group"
-      >
-        <div className="flex items-center gap-4">
-          <div
-            className="w-14 h-14 rounded-xl flex items-center justify-center text-2xl"
-            style={{ background: "linear-gradient(135deg, #C9A961, #8a7340)" }}
-          >
-            ✨
-          </div>
-          <div>
-            <div className="text-xl font-semibold text-[#C9A961] group-hover:text-[#e6c479]">
-              Yeni Dava Dosyası Aç
-            </div>
-            <div className="text-sm text-slate-400 mt-1">
-              Belgelerinizi sürükleyin, Orkestra Şefi karşılasın.
-            </div>
-          </div>
-        </div>
-      </Link>
+      <NextStepCard action={action} workspaceTitle={currentWorkspace?.title} />
 
-      <h2 className="text-sm uppercase tracking-widest text-slate-500 mb-4">
-        Aktif Dava Dosyaları ({workspaces.length})
-      </h2>
-
-      {workspaces.length === 0 ? (
-        <div className="text-center py-12 text-slate-500 text-sm">
-          Henüz workspace yok. Yukarıdaki butona basıp ilk davanızı oluşturun.
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {workspaces.map((w) => (
+      <section aria-labelledby="workspaces-title" className="flex flex-col gap-4">
+        <div className="flex items-end justify-between gap-4">
+          <h2 id="workspaces-title" className="font-sans text-sm font-semibold text-[var(--color-text)]">
+            Dava dosyalarınız{" "}
+            <span className="font-normal text-[var(--color-text-3)]">({workspaces.length})</span>
+          </h2>
+          {workspaces.length > 0 && (
             <Link
-              key={w.id}
-              href={`/v2/workspaces/${w.id}`}
-              className="block p-6 rounded-xl border border-white/10 hover:border-[#C9A961]/40 hover:bg-white/[0.02] transition"
+              href={NEW_WORKSPACE_HREF}
+              className="inline-flex items-center gap-1.5 text-[13px] text-[var(--color-gold-bright)] hover:underline"
             >
-              <div className="flex items-start justify-between mb-3">
-                <h3 className="font-semibold text-slate-100">{w.title}</h3>
-                <span
-                  className={`text-xs px-2 py-0.5 rounded-full ${
-                    w.status === "active"
-                      ? "bg-emerald-500/10 text-emerald-300 border border-emerald-500/30"
-                      : "bg-slate-500/10 text-slate-400 border border-slate-500/30"
-                  }`}
-                >
-                  {w.status === "active"
-                    ? "Aktif"
-                    : w.status === "completed"
-                    ? "Tamamlandı"
-                    : "Taslak"}
-                </span>
-              </div>
-              <div className="flex items-center gap-3 text-xs text-slate-400">
-                {w.case_type && <span>{w.case_type}</span>}
-                {w.current_round > 0 && (
-                  <>
-                    <span>•</span>
-                    <span className="text-[#C9A961]">
-                      TUR {w.current_round}/3
-                    </span>
-                  </>
-                )}
-                {w.total_cost_usd > 0 && (
-                  <>
-                    <span>•</span>
-                    <span className="text-slate-500">
-                      ${w.total_cost_usd.toFixed(3)}
-                    </span>
-                  </>
-                )}
-                <span className="ml-auto">
-                  {formatRelativeTr(w.updated_at)}
-                </span>
-              </div>
+              <Plus size={14} aria-hidden /> Yeni dosya
             </Link>
-          ))}
+          )}
         </div>
-      )}
+
+        {workspaces.length === 0 ? (
+          <p className="rounded-xl border border-dashed border-[var(--color-line-2)] px-6 py-10 text-center text-sm text-[var(--color-text-3)]">
+            Henüz dosyanız yok. Yukarıdaki &ldquo;Yeni dosya aç&rdquo; ile ilk davanızı oluşturun.
+          </p>
+        ) : (
+          <ul className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            {workspaces.map((w) => {
+              const next = resolveWorkspaceAction({ id: w.id, orchestrationStatus: w.orchestration_status });
+              return (
+                <li key={w.id}>
+                  <Link
+                    href={`/v2/workspaces/${w.id}`}
+                    className="flex h-full flex-col gap-3 rounded-xl border border-[var(--color-line)] bg-[var(--color-bg-1)] p-5 transition hover:border-[var(--color-gold)]/40 hover:bg-[var(--color-bg-2)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-gold)]"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <h3 className="font-sans text-[14.5px] font-semibold text-[var(--color-text)]">{w.title}</h3>
+                      <span className="shrink-0 rounded-full border border-[var(--color-line-2)] px-2 py-0.5 text-[11px] text-[var(--color-text-2)]">
+                        {STATUS_LABEL[w.status] ?? w.status}
+                      </span>
+                    </div>
+                    <p className="text-[12.5px] text-[var(--color-gold-bright)]">Sıradaki: {next.title}</p>
+                    <div className="mt-auto flex items-center gap-2 text-[11.5px] text-[var(--color-text-3)]">
+                      {w.case_type && <span>{w.case_type}</span>}
+                      {w.case_type && <span aria-hidden>·</span>}
+                      <span>{formatRelativeTr(w.updated_at)}</span>
+                    </div>
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
+      <SectionShortcuts />
 
       {isDemoMode && (
-        <div className="mt-12 p-4 rounded-lg border border-amber-500/20 bg-amber-500/5 text-xs text-amber-200/80">
-          <strong className="text-amber-300">Demo modu aktif:</strong> Supabase
-          env değişkenleri tanımlı değil, in-memory mock data gösteriliyor.
-          Production için .env.local + Vercel env ayarlanmalı.
-        </div>
+        <p className="rounded-lg border border-[var(--color-warn)]/25 bg-[var(--color-warn)]/5 p-4 text-xs text-[var(--color-warn)]">
+          <strong>Demo modu aktif:</strong> Supabase ortam değişkenleri tanımlı değil, geçici örnek veri gösteriliyor.
+        </p>
       )}
     </div>
   );

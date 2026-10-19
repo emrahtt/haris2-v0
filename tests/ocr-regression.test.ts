@@ -373,6 +373,48 @@ test("all-keys-missing reports failure without making network calls", async () =
   assert.ok(result.userMessage);
 });
 
+async function makeMixedPdf(): Promise<Buffer> {
+  const doc = await PDFDocument.load(await makePdf(1, "Readable digital legal text and docket information. ".repeat(30)));
+  const scan = await PDFDocument.load(await makeScannedPdf(1));
+  const [page] = await doc.copyPages(scan, [0]);
+  doc.addPage(page);
+  return Buffer.from(await doc.save({ useObjectStreams: false }));
+}
+
+test("auto mode does not mistake a long digital page for complete text in a mixed scanned PDF", async () => {
+  const buffer = await makeMixedPdf();
+  const parsed = await readPdfText(buffer);
+  assert.equal(assessTextQuality(parsed.text, parsed.pageCount).usable, true);
+  let calls = 0;
+  interceptRequests((url) => {
+    assert.ok(url.includes(":generateContent"));
+    calls++;
+    return geminiReply(pageText(1) + "\n" + pageText(2));
+  });
+  const result = await extractFromFile("mixed-scan.pdf", "application/pdf", buffer, "auto");
+  assert.equal(calls, 1, "The scanned page must trigger OCR despite sufficient aggregate text");
+  assertPageOrder(result.text, 2);
+  assert.equal(result.usedAI, true);
+});
+
+test("failed OCR cannot fall back to only the digital portion of a mixed scanned PDF", async () => {
+  process.env.GEMINI_API_KEY = "";
+  process.env.ANTHROPIC_API_KEY = "";
+  process.env.OPENAI_API_KEY = "";
+  const result = await extractFromFile("mixed-no-keys.pdf", "application/pdf", await makeMixedPdf(), "gemini_vision");
+  assert.equal(result.text, "");
+  assert.equal(result.incomplete, true);
+  assert.equal(result.pageCount, 2);
+});
+
+test("fast mode reports missing scanned pages without invoking AI or returning partial text", async () => {
+  const result = await extractFromFile("mixed-fast.pdf", "application/pdf", await makeMixedPdf(), "fast");
+  assert.equal(result.text, "");
+  assert.equal(result.incomplete, true);
+  assert.equal(result.usedAI, false);
+  assert.equal(result.pageCount, 2);
+});
+
 test("fast mode remains non-AI and digital PDFs keep their existing auto fast path", async () => {
   const buffer = await makePdf(1, "Legal document with readable digital text and case information. ".repeat(10));
   const fast = await extractFromFile("digital.pdf", "application/pdf", buffer, "fast");

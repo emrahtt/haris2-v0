@@ -5,15 +5,48 @@
 import pdfParse from "pdf-parse";
 import { PDFDocument } from "pdf-lib";
 
-function parsePdf(buffer: Buffer) {
+interface PdfTextPage {
+  pageNumber: number;
+  getTextContent(options: {
+    normalizeWhitespace: boolean;
+    disableCombineTextItems: boolean;
+  }): Promise<{ items: Array<{ str: string; transform: number[] }> }>;
+}
+
+async function parsePdf(buffer: Buffer): Promise<PdfTextResult> {
+  const pageTexts: string[] = [];
   // Legacy pdf.js expects copying Uint8Array.slice(), not Buffer.slice() views;
   // pdf-parse accepts typed arrays at runtime despite its Buffer-only declaration.
-  return pdfParse(new Uint8Array(buffer) as Buffer);
+  const parsed = await pdfParse(new Uint8Array(buffer) as Buffer, {
+    pagerender: async (page: PdfTextPage) => {
+      const content = await page.getTextContent({
+        normalizeWhitespace: false,
+        disableCombineTextItems: false,
+      });
+      let text = "";
+      let lastY: number | undefined;
+      for (const item of content.items) {
+        const y = item.transform[5];
+        text += lastY === y || !lastY ? item.str : `\n${item.str}`;
+        lastY = y;
+      }
+      pageTexts[page.pageNumber - 1] = text.trim();
+      return text;
+    },
+  });
+  const pageCount = parsed.numpages || 0;
+  return {
+    text: parsed.text?.trim() ?? "",
+    pageCount,
+    // pdf-parse swallows individual page failures, so unvisited pages must stay missing.
+    pageTexts: Array.from({ length: pageCount }, (_, i) => pageTexts[i] ?? ""),
+  };
 }
 
 export interface PdfTextResult {
   text: string;
   pageCount: number;
+  pageTexts: string[];
   /** pdf-parse orijinal dosyayı açamadı, pdf-lib ile yeniden yazılmış hali okundu */
   repairedBuffer?: Buffer;
 }
@@ -39,29 +72,33 @@ async function loadWithPdfLib(buffer: Buffer): Promise<PDFDocument | null> {
  */
 export async function readPdfText(buffer: Buffer): Promise<PdfTextResult> {
   try {
-    const parsed = await parsePdf(buffer);
-    return { text: parsed.text?.trim() ?? "", pageCount: parsed.numpages || 0 };
+    return await parsePdf(buffer);
   } catch {
     // aşağıda onarım denenir
   }
 
   const doc = await loadWithPdfLib(buffer);
-  if (!doc) return { text: "", pageCount: 0 };
+  if (!doc) return { text: "", pageCount: 0, pageTexts: [] };
 
   try {
     const repairedBuffer = Buffer.from(await doc.save());
     try {
       const parsed = await parsePdf(repairedBuffer);
+      return { ...parsed, repairedBuffer };
+    } catch {
       return {
-        text: parsed.text?.trim() ?? "",
-        pageCount: parsed.numpages || doc.getPageCount(),
+        text: "",
+        pageCount: doc.getPageCount(),
+        pageTexts: Array<string>(doc.getPageCount()).fill(""),
         repairedBuffer,
       };
-    } catch {
-      return { text: "", pageCount: doc.getPageCount(), repairedBuffer };
     }
   } catch {
-    return { text: "", pageCount: doc.getPageCount() };
+    return {
+      text: "",
+      pageCount: doc.getPageCount(),
+      pageTexts: Array<string>(doc.getPageCount()).fill(""),
+    };
   }
 }
 
@@ -105,6 +142,19 @@ export function assessTextQuality(text: string, pageCount: number): TextQuality 
   }
 
   return { usable: true };
+}
+
+export function assessPdfTextQuality(parsed: PdfTextResult): TextQuality {
+  if (parsed.pageCount < 1 || parsed.pageTexts.length !== parsed.pageCount) {
+    return { usable: false, reason: "PDF sayfa kapsamı doğrulanamadı" };
+  }
+  const overall = assessTextQuality(parsed.text, parsed.pageCount);
+  if (!overall.usable) return overall;
+  for (let i = 0; i < parsed.pageTexts.length; i++) {
+    const quality = assessTextQuality(parsed.pageTexts[i], 1);
+    if (!quality.usable) return { usable: false, reason: `Sayfa ${i + 1}: ${quality.reason}` };
+  }
+  return overall;
 }
 
 export interface PdfChunk {

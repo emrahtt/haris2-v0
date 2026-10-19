@@ -21,7 +21,7 @@ import { pdfToPng } from "pdf-to-png-converter";
 import { readUdf, isUdfFile } from "../udf/reader";
 import { getOcrModels, OCR_SYSTEM_PROMPT } from "./ocr-config";
 import { geminiOcr, hasGeminiKey } from "./gemini-ocr";
-import { readPdfText, assessTextQuality, splitPdf, type PdfChunk } from "./pdf-utils";
+import { readPdfText, assessPdfTextQuality, splitPdf, type PdfChunk } from "./pdf-utils";
 import { prepareImage } from "./image-prep";
 import { readPdfOcrPages, formatPdfOcrPages } from "./pdf-coverage";
 
@@ -156,10 +156,22 @@ async function extractPdf(
 
   const parsed = await readPdfText(buffer);
   const pageCount = parsed.pageCount;
-  const quality = assessTextQuality(parsed.text, pageCount);
+  const quality = assessPdfTextQuality(parsed);
   const parserLabel = parsed.repairedBuffer ? "pdf-parse (onarılmış PDF)" : "pdf-parse";
 
   if (method === "fast") {
+    const missing = parsed.pageTexts.flatMap((text, i) => text.trim() ? [] : [i + 1]);
+    if (missing.length > 0) {
+      return {
+        ...errorResult(
+          startTime,
+          `PDF metin katmanında eksik sayfalar: ${missing.join(", ")}`,
+          "PDF'in bazı sayfalarında metin bulunamadı. Eksik metin analize alınmadı; 'Akıllı' veya 'Gemini' yöntemini deneyin."
+        ),
+        pageCount,
+        incomplete: true,
+      };
+    }
     if (parsed.text.length > 50) {
       return {
         text: parsed.text,
@@ -204,7 +216,7 @@ async function extractPdf(
   const result = await runEngineChain(ENGINE_ORDER[method], runEngine, pageCount, startTime);
   if (result.text) return result;
 
-  if (!result.incomplete && parsed.text.length > 50) {
+  if (!result.incomplete && quality.usable) {
     return {
       text: parsed.text,
       pageCount,
@@ -217,7 +229,11 @@ async function extractPdf(
         "⚠️ AI modelleri belgeyi okuyamadı; ham PDF metni kullanıldı, hatalı karakterler içerebilir.",
     };
   }
-  return { ...result, pageCount };
+  return {
+    ...result,
+    pageCount,
+    incomplete: result.incomplete || !quality.usable,
+  };
 }
 
 function runPdfEngine(

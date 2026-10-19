@@ -174,7 +174,7 @@ async function callModel(
         ok: true,
         text,
         model,
-        truncated: finishReason === "MAX_TOKENS",
+        truncated: finishReason !== "STOP",
         cost: (inputTokens * 0.5 + outputTokens * 3) / 1_000_000,
       };
     } catch (e) {

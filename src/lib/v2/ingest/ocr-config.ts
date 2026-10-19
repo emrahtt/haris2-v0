@@ -59,6 +59,6 @@ KURALLAR:
 4. Tabloları Markdown table formatında (| sütun | sütun |) yaz
 5. Grafikleri açıkla: [GRAFİK: kısa açıklama]
 6. Damga/imza/kaşeyi belirt: [DAMGA] [İMZA] [KAŞE]
-7. Sayfa başlarını işaretle: --- SAYFA N ---
+7. Her sayfanın başını tam olarak --- SAYFA N --- ile işaretle; tamamen boş sayfalara [BOŞ SAYFA] yaz
 8. Paragraf yapısı, madde numaraları, listeler korunmalı
 9. T.C. kimlik no, esas/karar no, tarih ve tutarları rakam rakam dikkatle oku`;

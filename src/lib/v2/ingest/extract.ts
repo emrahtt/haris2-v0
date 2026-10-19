@@ -11,8 +11,9 @@
  *   - "openai_vision"  → PDF → PNG → GPT Vision (sayfa sayfa)
  *   - "best_of_3"      → 3 motor paralel, en iyi çıktı
  *
- * Seçilen motor başarısız olursa diğer motorlara sırayla düşülür; belge ancak
- * hepsi başarısız olursa hata verir.
+ * Seçilen motor başarısız olursa diğer motorlara sırayla düşülür. Gemini'nin
+ * eksik sayfaları ayrıca tek sayfalık PDF olarak Claude/OpenAI ile yeniden denenir.
+ * Sayfa bütünlüğü doğrulanamayan PDF metni başarılı sonuç olarak döndürülmez.
  */
 
 import mammoth from "mammoth";
@@ -22,6 +23,7 @@ import { getOcrModels, OCR_SYSTEM_PROMPT } from "./ocr-config";
 import { geminiOcr, hasGeminiKey } from "./gemini-ocr";
 import { readPdfText, assessTextQuality, splitPdf, type PdfChunk } from "./pdf-utils";
 import { prepareImage } from "./image-prep";
+import { readPdfOcrPages, formatPdfOcrPages } from "./pdf-coverage";
 
 export type ExtractionMethod =
   | "auto"
@@ -40,6 +42,7 @@ export interface ExtractResult {
   estimatedCost?: number;
   durationMs?: number;
   error?: string;
+  incomplete?: boolean;
   userMessage?: string;
   /** Best-of-3 sonucunda hangi modelin kazandığı + diğer skorları */
   comparison?: Array<{ model: string; chars: number; cost: number }>;
@@ -55,6 +58,7 @@ interface EngineOutcome {
   pageCount?: number;
   warning?: string;
   error?: string;
+  incomplete?: boolean;
 }
 
 const MAX_PDF_SIZE = 30 * 1024 * 1024;
@@ -200,7 +204,7 @@ async function extractPdf(
   const result = await runEngineChain(ENGINE_ORDER[method], runEngine, pageCount, startTime);
   if (result.text) return result;
 
-  if (parsed.text.length > 50) {
+  if (!result.incomplete && parsed.text.length > 50) {
     return {
       text: parsed.text,
       pageCount,
@@ -224,7 +228,7 @@ function runPdfEngine(
 ): Promise<EngineOutcome> {
   if (engine === "gemini") return pdfWithGemini(original, pageCount);
   if (engine === "claude") return pdfWithClaude(original, pageCount);
-  return pdfWithOpenAI(rasterSource);
+  return pdfWithOpenAI(rasterSource, pageCount);
 }
 
 async function pdfWithGemini(buffer: Buffer, pageCount: number): Promise<EngineOutcome> {
@@ -247,33 +251,69 @@ async function pdfWithGemini(buffer: Buffer, pageCount: number): Promise<EngineO
     3
   );
 
-  const succeeded = results.filter((r) => r.ok);
-  if (succeeded.length === 0) {
-    return engineFail(results.map((r) => r.error).filter(Boolean).join(" | ") || "Gemini başarısız");
+  const pages = new Map<number, string>();
+  const models = new Set<string>();
+  let cost = results.reduce((sum, r) => sum + r.cost, 0);
+  const retries: Array<{ data: Buffer; page: number }> = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const result = results[i];
+    const readable = result.ok
+      ? readPdfOcrPages(result.text, chunk.startPage, chunk.endPage, result.truncated)
+      : new Map<number, string>();
+    readable.forEach((text, page) => pages.set(page, text));
+    if (readable.size > 0) models.add(`Gemini ${result.model ?? getOcrModels().gemini}`);
+
+    if (readable.size === chunk.endPage - chunk.startPage + 1) continue;
+    const singlePages = await splitPdf(chunk.data, 1);
+    if (!singlePages || singlePages.length !== chunk.endPage - chunk.startPage + 1) continue;
+    for (let j = 0; j < singlePages.length; j++) {
+      const page = chunk.startPage + j;
+      if (!pages.has(page)) retries.push({ data: singlePages[j].data, page });
+    }
   }
 
-  const text = results
-    .map((r, i) =>
-      r.ok
-        ? r.text
-        : `--- SAYFA ${chunks[i].startPage}-${chunks[i].endPage} (OKUNAMADI) ---\n[${r.error}]`
-    )
-    .join("\n\n");
+  const recovered = await runWithLimit(
+    retries.map(({ data, page }) => async () => {
+      const claude = await pdfWithClaude(data, 1, page, totalPages);
+      if (isUsableOutcome(claude)) return { page, outcome: claude };
+      const openai = await pdfWithOpenAI(data, 1, page, totalPages);
+      return { page, outcome: { ...openai, cost: claude.cost + openai.cost } };
+    }),
+    3
+  );
+  for (const { page, outcome } of recovered) {
+    cost += outcome.cost;
+    if (!isUsableOutcome(outcome)) continue;
+    const text = readPdfOcrPages(outcome.text, page, page).get(page);
+    if (text) {
+      pages.set(page, text);
+      models.add(outcome.modelUsed);
+    }
+  }
 
-  const failed = results.length - succeeded.length;
-  const truncated = succeeded.some((r) => r.truncated);
-  const model = succeeded[0].model ?? getOcrModels().gemini;
+  const missing = Array.from({ length: totalPages }, (_, i) => i + 1).filter((page) => !pages.has(page));
+  if (!totalPages || missing.length > 0) {
+    return {
+      ...engineFail(totalPages
+        ? `PDF sayfaları okunamadı: ${missing.join(", ")}`
+        : "PDF sayfa sayısı doğrulanamadı"),
+      pageCount: totalPages || undefined,
+      incomplete: true,
+      cost,
+    };
+  }
 
   return {
     ok: true,
-    text,
-    pageCount: totalPages || undefined,
-    modelUsed: `Gemini ${model} (native PDF${chunks.length > 1 ? `, ${chunks.length} parça` : ""})`,
-    cost: results.reduce((sum, r) => sum + r.cost, 0),
-    warning: joinMessages(
-      failed > 0 ? `⚠️ ${failed}/${chunks.length} bölüm okunamadı, geri kalanı işlendi.` : undefined,
-      truncated ? "⚠️ Belgenin bir kısmı çok uzun olduğu için kesilmiş olabilir." : undefined
-    ),
+    text: formatPdfOcrPages(pages),
+    pageCount: totalPages,
+    modelUsed: `${[...models].join(" + ")} (native PDF${chunks.length > 1 ? `, ${chunks.length} parça` : ""})`,
+    cost,
+    warning: recovered.some(({ outcome }) => outcome.ok)
+      ? "Eksik PDF sayfaları alternatif OCR motorlarıyla tamamlandı."
+      : undefined,
   };
 }
 
@@ -284,26 +324,42 @@ function pdfChunkPrompt(chunk: PdfChunk, chunkCount: number, totalPages: number)
   return `Bu PDF, toplam ${totalPages} sayfalık bir belgenin ${chunk.startPage}-${chunk.endPage}. sayfalarıdır. Bu bölümdeki TÜM metni eksiksiz ve birebir çıkar. Sayfa işaretlerini gerçek sayfa numaralarıyla yaz: ilk sayfa --- SAYFA ${chunk.startPage} --- olmalı.`;
 }
 
-async function pdfWithClaude(buffer: Buffer, pageCount: number): Promise<EngineOutcome> {
+async function pdfWithClaude(
+  buffer: Buffer,
+  pageCount: number,
+  startPage = 1,
+  totalPages = pageCount
+): Promise<EngineOutcome> {
+  const chunk = { data: buffer, startPage, endPage: startPage + pageCount - 1 };
   const content = [
     {
       type: "document",
       source: { type: "base64", media_type: "application/pdf", data: buffer.toString("base64") },
     },
-    { type: "text", text: "Bu PDF'in tüm içeriğini eksiksiz ve birebir metne çevir." },
+    { type: "text", text: pdfChunkPrompt(chunk, startPage === 1 ? 1 : 2, totalPages) },
   ];
   const maxTokens = Math.min(Math.max((pageCount || 5) * 800, 4000), 16000);
   const r = await callClaude(content, maxTokens);
   if (!r.ok) return engineFail(r.error);
+  const pages = readPdfOcrPages(r.text, startPage, chunk.endPage, r.truncated);
+  if (!pageCount || pages.size !== pageCount) {
+    return { ...engineFail("Claude PDF sayfa bütünlüğü doğrulanamadı"), incomplete: true, cost: r.cost };
+  }
   return {
     ok: true,
-    text: r.text,
+    text: formatPdfOcrPages(pages),
+    pageCount,
     modelUsed: `Claude ${r.model} (native PDF)`,
     cost: r.cost,
   };
 }
 
-async function pdfWithOpenAI(buffer: Buffer): Promise<EngineOutcome> {
+async function pdfWithOpenAI(
+  buffer: Buffer,
+  expectedPages = 0,
+  startPage = 1,
+  totalPages = expectedPages
+): Promise<EngineOutcome> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return engineFail("OPENAI_API_KEY eksik");
 
@@ -313,37 +369,37 @@ async function pdfWithOpenAI(buffer: Buffer): Promise<EngineOutcome> {
   } catch (e) {
     return engineFail(`PDF→PNG dönüşümü başarısız: ${String(e).slice(0, 150)}`);
   }
-  if (pngPages.length === 0) return engineFail("PDF→PNG dönüşüm 0 sayfa döndü");
+  if (pngPages.length === 0 || (expectedPages > 0 && pngPages.length !== expectedPages)) {
+    return { ...engineFail("PDF→PNG sayfa sayısı uyuşmuyor"), incomplete: true };
+  }
 
   const model = getOcrModels().openai;
   const results = await runWithLimit(
     pngPages.map((page, i) => () =>
-      callOpenAIVision(apiKey, model, page.content as Buffer, "image/png", i + 1, pngPages.length)
+      callOpenAIVision(apiKey, model, page.content as Buffer, "image/png", startPage + i, totalPages || pngPages.length)
     ),
     3
   );
 
-  const failed = results.filter((r) => !r.success).length;
-  if (failed === results.length) {
-    return engineFail(results[0]?.error ?? "GPT Vision hiçbir sayfayı okuyamadı");
+  const pages = new Map<number, string>();
+  results.forEach((r, i) => {
+    const page = startPage + i;
+    if (!r.success) return;
+    const text = readPdfOcrPages(r.text, page, page).get(page);
+    if (text) pages.set(page, text);
+  });
+  const cost = results.reduce((sum, r) => sum + (r.cost ?? 0), 0);
+  if (pages.size !== pngPages.length) {
+    const missing = results.flatMap((_, i) => pages.has(startPage + i) ? [] : [startPage + i]);
+    return { ...engineFail(`GPT Vision sayfaları okunamadı: ${missing.join(", ")}`), incomplete: true, cost };
   }
-
-  const text = results
-    .map((r, i) =>
-      r.success
-        ? `--- SAYFA ${i + 1} ---\n\n${r.text}`
-        : `--- SAYFA ${i + 1} (OKUNAMADI) ---\n[${r.error}]`
-    )
-    .join("\n\n");
 
   return {
     ok: true,
-    text,
+    text: formatPdfOcrPages(pages),
     pageCount: pngPages.length,
     modelUsed: `GPT ${model} Vision (${pngPages.length} sayfa)`,
-    cost: results.reduce((sum, r) => sum + (r.cost ?? 0), 0),
-    warning:
-      failed > 0 ? `⚠️ ${failed}/${pngPages.length} sayfa okunamadı. Geri kalanı işlendi.` : undefined,
+    cost,
   };
 }
 
@@ -424,11 +480,13 @@ async function runEngineChain(
 ): Promise<ExtractResult> {
   const failures: string[] = [];
   let spent = 0;
+  let incomplete = false;
 
   for (const engine of order) {
     const outcome = await runEngine(engine);
     spent += outcome.cost;
-    if (outcome.ok && !looksLikeAIFailure(outcome.text)) {
+    incomplete ||= outcome.incomplete ?? false;
+    if (isUsableOutcome(outcome)) {
       const fellBack =
         engine !== order[0]
           ? `ℹ️ ${ENGINE_LABEL[order[0]]} okuyamadı, ${ENGINE_LABEL[engine]} ile okundu.`
@@ -452,9 +510,13 @@ async function runEngineChain(
     ...errorResult(
       startTime,
       failures.join(" | "),
-      `❌ Belge hiçbir modelle okunamadı. ${humanizeError(failures[0])}`
+      incomplete
+        ? "PDF'in tüm sayfaları okunamadı. Eksik metin analize alınmadı; belgeyi kontrol edip yeniden yükleyin."
+        : `❌ Belge hiçbir modelle okunamadı. ${humanizeError(failures[0])}`
     ),
     estimatedCost: spent,
+    incomplete,
+    usedAI: spent > 0,
   };
 }
 
@@ -476,7 +538,7 @@ function pickBestOf3(
     cost: r.cost,
   }));
   const totalCost = comparison.reduce((sum, c) => sum + c.cost, 0);
-  const valid = results.filter((r) => r.ok && !looksLikeAIFailure(r.text));
+  const valid = results.filter(isUsableOutcome);
 
   if (valid.length === 0) {
     return {
@@ -489,6 +551,7 @@ function pickBestOf3(
       method: "best_of_3",
       modelUsed: "Best-of-3 (tümü başarısız)",
       estimatedCost: totalCost,
+      incomplete: results.some((r) => r.incomplete),
       comparison,
     };
   }
@@ -514,7 +577,7 @@ function pickBestOf3(
 async function callClaude(
   content: unknown[],
   maxTokens: number
-): Promise<{ ok: true; text: string; model: string; cost: number } | { ok: false; error: string }> {
+): Promise<{ ok: true; text: string; model: string; cost: number; truncated: boolean } | { ok: false; error: string }> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return { ok: false, error: "ANTHROPIC_API_KEY eksik" };
 
@@ -568,6 +631,7 @@ async function callClaude(
         ok: true,
         text: text.trim(),
         model,
+        truncated: data.stop_reason !== "end_turn",
         cost: (inputTokens * 3 + outputTokens * 15) / 1_000_000,
       };
     } catch (e) {
@@ -645,8 +709,13 @@ async function callOpenAIVision(
       const inputTokens = data.usage?.prompt_tokens || 0;
       const outputTokens = data.usage?.completion_tokens || 0;
 
-      if (!text || text.length < 5) {
-        return { success: false, text: "", error: "Boş yanıt" };
+      if (!text || text.length < 5 || data.choices?.[0]?.finish_reason !== "stop") {
+        return {
+          success: false,
+          text: "",
+          cost: (inputTokens * 2.5 + outputTokens * 10) / 1_000_000,
+          error: text.length < 5 ? "Boş yanıt" : "GPT çıktısı tamamlanmadı",
+        };
       }
       return {
         success: true,
@@ -724,6 +793,11 @@ function guessImageMime(lowerFilename: string): string {
   if (lowerFilename.endsWith(".bmp")) return "image/bmp";
   if (lowerFilename.endsWith(".gif")) return "image/gif";
   return "image/png";
+}
+
+function isUsableOutcome(outcome: EngineOutcome): boolean {
+  return outcome.ok && !outcome.incomplete &&
+    (Boolean(outcome.pageCount) || !looksLikeAIFailure(outcome.text));
 }
 
 function looksLikeAIFailure(text: string): boolean {

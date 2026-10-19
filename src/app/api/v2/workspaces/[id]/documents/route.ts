@@ -113,7 +113,7 @@ export async function POST(
         if (result.usedAI) await consumeAiCall(userId, 1);
         await incrementUsage("documents_uploaded", 1, userId);
 
-        if (!result.text || result.text.length < 10) {
+        if (result.incomplete || !result.text || result.text.length < 10) {
           await updateDocument(id, doc.id, {
             status: "error",
             errorMessage:

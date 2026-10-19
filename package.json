@@ -10,6 +10,7 @@
     "lint": "next lint --no-cache",
     "lint:fix": "next lint --fix",
     "type-check": "tsc --noEmit",
+    "test:ocr": "tsx --test tests/ocr-regression.test.ts",
     "audit": "npm audit --omit=dev",
     "rag:index": "tsx scripts/index-corpus.ts"
   },

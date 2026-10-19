@@ -5,6 +5,12 @@
 import pdfParse from "pdf-parse";
 import { PDFDocument } from "pdf-lib";
 
+function parsePdf(buffer: Buffer) {
+  // Legacy pdf.js expects copying Uint8Array.slice(), not Buffer.slice() views;
+  // pdf-parse accepts typed arrays at runtime despite its Buffer-only declaration.
+  return pdfParse(new Uint8Array(buffer) as Buffer);
+}
+
 export interface PdfTextResult {
   text: string;
   pageCount: number;
@@ -14,11 +20,14 @@ export interface PdfTextResult {
 
 async function loadWithPdfLib(buffer: Buffer): Promise<PDFDocument | null> {
   try {
-    return await PDFDocument.load(buffer, {
+    const doc = await PDFDocument.load(buffer, {
       ignoreEncryption: true,
       throwOnInvalidObject: false,
       updateMetadata: false,
     });
+    // pdf-lib can load a catalog-less file but throw only when its page tree is accessed.
+    doc.getPageCount();
+    return doc;
   } catch {
     return null;
   }
@@ -30,7 +39,7 @@ async function loadWithPdfLib(buffer: Buffer): Promise<PDFDocument | null> {
  */
 export async function readPdfText(buffer: Buffer): Promise<PdfTextResult> {
   try {
-    const parsed = await pdfParse(buffer);
+    const parsed = await parsePdf(buffer);
     return { text: parsed.text?.trim() ?? "", pageCount: parsed.numpages || 0 };
   } catch {
     // aşağıda onarım denenir
@@ -42,7 +51,7 @@ export async function readPdfText(buffer: Buffer): Promise<PdfTextResult> {
   try {
     const repairedBuffer = Buffer.from(await doc.save());
     try {
-      const parsed = await pdfParse(repairedBuffer);
+      const parsed = await parsePdf(repairedBuffer);
       return {
         text: parsed.text?.trim() ?? "",
         pageCount: parsed.numpages || doc.getPageCount(),

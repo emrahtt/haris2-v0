@@ -7,7 +7,7 @@
  * bir Claude modeli yazıldığında OpenAI OCR hattının tamamen kırılmasına yol açıyordu.
  *
  * Env değişkenleri ("provider:model" veya sadece "model" formatı kabul edilir):
- *   HARIS_OCR_MODEL           → Birincil OCR (Gemini, native PDF)   varsayılan: gemini-3.8-flash
+ *   HARIS_OCR_MODEL           → Birincil OCR (Gemini, native PDF)   varsayılan: gemini-4-argon
  *   HARIS_OCR_FALLBACK_MODEL  → Gemini yedek modeli                 varsayılan: gemini-3.5-flash
  *   HARIS_OCR_CLAUDE_MODEL    → Claude native PDF OCR               varsayılan: claude-sonnet-4-6
  *   HARIS_OCR_OPENAI_MODEL    → OpenAI sayfa-görsel OCR             varsayılan: gpt-4o
@@ -28,7 +28,7 @@ function primaryGeminiModel(): string {
   // Eski HARIS_GEMINI_MODEL hâlâ okunur, ama kapatılmış bir modeli gösteriyorsa yok sayılır.
   const legacy = modelId(process.env.HARIS_GEMINI_MODEL);
   if (legacy && !RETIRED_GEMINI_MODEL.test(legacy)) return legacy;
-  return "gemini-3.8-flash";
+  return "gemini-4-argon";
 }
 
 export interface OcrModels {
